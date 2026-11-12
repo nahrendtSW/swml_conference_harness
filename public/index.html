@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Support bridge (SWML)</title>
+  <style>
+    :root { --bg: #fff; --ink: #1d2433; --muted-ink: #4a5468; --warn: #8a5a00; --line: #d7dce5; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #161a22; --ink: #e6e9ef; --muted-ink: #a3abbb; --warn: #e0a83a; --line: #2f3646; } }
+    body { font: 16px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 3rem auto; padding: 0 1rem; color: var(--ink); background: var(--bg); }
+    button { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: .5rem 1rem; margin: 0 .5rem .5rem 0; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: default; }
+    button:focus-visible { outline: 3px solid #2f6fdb; outline-offset: 2px; }
+    #status, #callid, #token { margin: .5rem 0 0; color: var(--muted-ink); }
+    #callid { font-family: ui-monospace, monospace; font-size: .85rem; }
+    #token { font-size: .85rem; }
+    #notice { margin-top: .5rem; color: var(--warn); min-height: 1.5em; }
+  </style>
+</head>
+<body>
+  <h1>Support bridge</h1>
+  <p>Join the room yourself, or wait for the console to dial you and answer.</p>
+  <button id="join">Join conference</button>
+  <button id="answer" disabled>Answer</button>
+  <button id="decline" disabled>Decline</button>
+  <button id="mute" disabled>Mute</button>
+  <button id="leave" disabled>Leave</button>
+  <p id="status">Signing in…</p>
+  <p id="callid"></p>
+  <p id="token">Getting a SAT…</p>
+  <p id="notice" role="status"></p>
+
+  <audio id="remoteAudio" autoplay></audio>
+
+  <script type="module">
+    // Pin a version in production instead of @latest
+    import { SignalWire, StaticCredentialProvider } from "https://esm.sh/@signalwire/js@latest";
+
+    // Optional fallback SAT, used only when the server has no SUBSCRIBER_REFERENCE (POST /api/sat returns 501).
+    // Normally leave this empty: the server mints SATs and the SDK asks it for a new one before each expires.
+    const FALLBACK_SAT = "";
+
+    // Address of the SWML Webhook resource whose External URL is <PUBLIC_URL>/swml/conference
+    const CONFERENCE_ADDRESS = "/public/support-bridge-4";
+
+    // The "from" value the console shows for this browser leg. Only needed when Call.id doesn't match
+    // the participant's call ID and more than one browser is connected.
+    const IDENTITY = "";
+
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (s) => ($("status").textContent = s);
+    const notify = (s = "") => ($("notice").textContent = s);
+
+    // ---- SAT regeneration ----
+    // authenticate() runs once at startup; the SDK calls refresh() shortly before expiry_at and swaps the new
+    // token into the live session. Both ask this server, which holds the API token and mints the SAT.
+    let refreshes = 0;
+    const showToken = (sat, note = "") =>
+      ($("token").textContent =
+        `SAT for ${sat.reference ?? "subscriber"} valid until ${new Date(sat.expiry_at).toLocaleTimeString()}` +
+        `${sat.clientBound ? " (client-bound, SDK refreshes itself)" : ""} · refreshed ${refreshes}×${note ? ` · ${note}` : ""}`);
+
+    async function fetchSat(reason, fingerprint) {
+      const res = await fetch("/api/sat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason, fingerprint }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const err = new Error(body.error ?? `SAT request failed (${res.status})`);
+        err.status = res.status;
+        throw err;
+      }
+      return body;
+    }
+
+    const credentialProvider = {
+      async authenticate(context) {
+        try {
+          const sat = await fetchSat("authenticate", context?.fingerprint);
+          showToken(sat);
+          return { token: sat.token, expiry_at: sat.expiry_at };
+        } catch (err) {
+          if (err.status === 501 && FALLBACK_SAT) {
+            $("token").textContent = "Using the fallback SAT from index.html (no automatic refresh).";
+            return new StaticCredentialProvider({ token: FALLBACK_SAT }).authenticate();
+          }
+          throw err;
+        }
+      },
+      async refresh() {
+        try {
+          const sat = await fetchSat("refresh");
+          refreshes += 1;
+          showToken(sat);
+          return { token: sat.token, expiry_at: sat.expiry_at };
+        } catch (err) {
+          $("token").textContent = `SAT refresh failed: ${err.message}. The SDK will retry.`;
+          throw err;
+        }
+      },
+    };
+
+    const client = new SignalWire(credentialProvider);
+    client.warnings$?.subscribe((w) => console.warn("SDK warning:", w));
+    let call;
+    let ringing;
+    let connected = false;
+    let muted = false; // mirrors the conference's participant record, not the local mic
+
+    // Registering lets the console's Dial reach this browser at its subscriber address
+    try {
+      await client.register();
+      setStatus("Registered. Not in a call.");
+    } catch (err) {
+      setStatus(`Couldn't register: ${err.message}`);
+    }
+
+    client.session.incomingCalls$.subscribe((calls) => {
+      const next = calls.find((c) => c.status === "ringing");
+      if (!next || call) return;
+      ringing = next;
+      setStatus("Incoming call from the console");
+      $("callid").textContent = `Incoming Call.id: ${ringing.id}`;
+      $("answer").disabled = false;
+      $("decline").disabled = false;
+      $("join").disabled = true;
+    });
+
+    // ---- Conference state from the server (single source of truth) ----
+    const events = new EventSource("/api/events");
+    events.onmessage = (e) => {
+      if (!connected) return;
+      const { rooms = [] } = JSON.parse(e.data);
+      const legs = rooms.flatMap((r) => r.participants.map((p) => ({ ...p, room: r.name })));
+      const webrtc = legs.filter((p) => p.type === "webrtc");
+      const me =
+        legs.find((p) => p.callId === call?.id) ||
+        (IDENTITY ? webrtc.find((p) => p.from === IDENTITY) : webrtc.length === 1 ? webrtc[0] : null);
+      if (!me) return;
+
+      muted = Boolean(me.muted);
+      $("mute").textContent = muted ? "Unmute" : "Mute";
+      notify(
+        me.hold ? "An operator put you on hold." :
+        me.coaching ? "You're coaching. Only the coached participant hears you." :
+        muted ? "You're muted in the conference." :
+        me.room !== rooms[0]?.name ? `You're in ${me.room}.` : ""
+      );
+    };
+
+    function attach(c) {
+      call = c;
+      $("callid").textContent = `Call.id: ${c.id}`;
+      c.remoteStream$.subscribe((stream) => ($("remoteAudio").srcObject = stream));
+      c.status$.subscribe((status) => {
+        setStatus(`Status: ${status}`);
+        connected = status === "connected";
+        $("mute").disabled = !connected;
+        $("leave").disabled = !connected;
+        if (status === "disconnected") resetUI();
+      });
+    }
+
+    $("join").onclick = async () => {
+      $("join").disabled = true;
+      setStatus("Dialing…");
+      try {
+        attach(await client.dial(CONFERENCE_ADDRESS, { audio: true, video: false, receiveAudio: true, receiveVideo: false }));
+      } catch (err) {
+        console.error(err);
+        setStatus(`Couldn't join: ${err.message}`);
+        resetUI();
+      }
+    };
+
+    $("answer").onclick = async () => {
+      $("answer").disabled = true;
+      $("decline").disabled = true;
+      try {
+        await ringing.answer({ audio: true, video: false });
+        attach(ringing);
+      } catch (err) {
+        setStatus(`Couldn't answer: ${err.message}`);
+        resetUI();
+      }
+    };
+
+    $("decline").onclick = () => {
+      ringing?.reject();
+      resetUI();
+    };
+
+    // Mute at the conference (Compat participant REST), so the console and the Compat list agree.
+    // The server tries this browser's Call.id first, which also tests whether it equals the participant's call ID.
+    $("mute").onclick = async () => {
+      $("mute").disabled = true;
+      try {
+        const res = await fetch("/api/self/mute", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ muted: !muted, callId: call?.id, identity: IDENTITY || undefined }),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.error);
+        muted = body.muted;
+        $("mute").textContent = muted ? "Unmute" : "Mute";
+        notify(`${muted ? "You're muted in the conference." : ""} ${body.matchedByCallId ? "" : "(Call.id didn't match the participant ID.)"}`.trim());
+      } catch (err) {
+        notify(`Couldn't change mute: ${err.message}`);
+      } finally {
+        $("mute").disabled = !connected;
+      }
+    };
+
+    $("leave").onclick = () => call?.hangup();
+
+    function resetUI() {
+      call = undefined;
+      ringing = undefined;
+      connected = false;
+      muted = false;
+      notify();
+      $("callid").textContent = "";
+      $("join").disabled = false;
+      $("answer").disabled = true;
+      $("decline").disabled = true;
+      $("mute").disabled = true;
+      $("mute").textContent = "Mute";
+      $("leave").disabled = true;
+      setStatus("Registered. Not in a call.");
+    }
+  </script>
+</body>
+</html>

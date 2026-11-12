@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Conference console (SWML)</title>
+  <style>
+    :root {
+      --bg: #ffffff; --ink: #1d2433; --muted-ink: #4a5468; --line: #d7dce5; --panel: #f4f6f9;
+      --hold: #8a5a00; --mute: #a3262e; --live: #1f7a4d; --coach: #3b4fb8; --warn-bg: #fff4d6;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #161a22; --ink: #e6e9ef; --muted-ink: #a3abbb; --line: #2f3646; --panel: #1e2430;
+        --hold: #e0a83a; --mute: #f07b82; --live: #5ccf96; --coach: #9aa8f5; --warn-bg: #3a3017;
+      }
+    }
+    body { font: 15px/1.5 system-ui, sans-serif; color: var(--ink); background: var(--bg); max-width: 72rem; margin: 2rem auto; padding: 0 1rem; }
+    h1 { margin: 0 0 .25rem; font-size: 1.5rem; }
+    h2 { margin: 2rem 0 .25rem; font-size: 1.15rem; }
+    .note, #summary { color: var(--muted-ink); margin: 0 0 .75rem; }
+    #error { color: var(--mute); min-height: 1.5em; }
+    .wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: .5rem; border-bottom: 1px solid var(--line); vertical-align: middle; }
+    th { font-weight: 600; color: var(--muted-ink); }
+    td.sid { font-family: ui-monospace, monospace; font-size: .78rem; color: var(--muted-ink); }
+    tr.mismatch td { background: var(--warn-bg); }
+    .state { font-weight: 600; }
+    .state.live { color: var(--live); } .state.muted { color: var(--mute); }
+    .state.hold { color: var(--hold); } .state.coach { color: var(--coach); }
+    button, select, input { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: .25rem .6rem; }
+    button { margin: .1rem .25rem .1rem 0; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: default; }
+    button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid #2f6fdb; outline-offset: 2px; }
+    button.danger { color: var(--mute); }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .75rem 1rem; }
+    .row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: end; }
+    .row label { display: flex; flex-direction: column; font-size: .85rem; color: var(--muted-ink); }
+    .empty { color: var(--muted-ink); padding: 1rem .5rem; }
+    .compat { font-size: .85rem; }
+    .group { display: flex; flex-wrap: wrap; align-items: center; gap: .1rem; margin-bottom: .2rem; }
+    .via { font-size: .8rem; color: var(--muted-ink); width: 5.5rem; }
+    .target { font-size: .8rem; color: var(--muted-ink); display: inline-flex; gap: .4rem; align-items: center; margin-left: 5.6rem; }
+    details pre { white-space: pre-wrap; word-break: break-all; font-size: .78rem; margin: .25rem 0 0; }
+  </style>
+</head>
+<body>
+  <h1>Conference console (SWML join_conference)</h1>
+  <p id="summary">Connecting…</p>
+  <p id="error" role="alert"></p>
+
+  <section class="panel" aria-labelledby="dial-h">
+    <h2 id="dial-h" style="margin-top:0">Dial a Calling API leg into the room</h2>
+    <p class="note">Rings a phone number, SIP URI, or subscriber address (/private/name), then runs join_conference when it answers.</p>
+    <div class="row">
+      <label>To <input id="dial-to" placeholder="/private/banker-1" size="24" /></label>
+      <label>Room <select id="dial-room"></select></label>
+      <label>Joins as
+        <select id="dial-role">
+          <option value="participant">Participant</option>
+          <option value="monitor">Monitor (muted)</option>
+          <option value="coach">Coach</option>
+        </select>
+      </label>
+      <label>Coaching <select id="dial-coach" disabled></select></label>
+      <button id="dial-go">Dial</button>
+    </div>
+  </section>
+
+  <div id="rooms"></div>
+
+  <h2>Parked on hold music</h2>
+  <p class="note">These legs left the conference through a Calling API update and hear looping music until you return them.</p>
+  <div class="wrap">
+    <table>
+      <thead><tr><th>Caller</th><th>Type</th><th>Parked</th><th>Actions</th><th>Call ID</th></tr></thead>
+      <tbody id="parked"></tbody>
+    </table>
+  </div>
+
+  <h2>Event log</h2>
+  <p class="note">Newest first: status callbacks, dial events, and this console's API calls. Open a row for its details, including the callback's query string.</p>
+  <div class="wrap">
+    <table>
+      <thead><tr><th>Time</th><th>Source</th><th>Event</th><th>Call ID</th></tr></thead>
+      <tbody id="log"></tbody>
+    </table>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+    const short = (id) => (id ? id.slice(0, 8) : "");
+    let state = { rooms: [], parked: [], events: [] };
+
+    function label(p) {
+      return p.subscriber || p.from || "Unknown";
+    }
+
+    function stateCell(p) {
+      if (p.hold) return `<span class="state hold">On hold</span>`;
+      if (p.coaching) return `<span class="state coach">Coaching ${esc(short(p.coachTarget))}</span>`;
+      if (p.muted) return `<span class="state muted">Muted</span>`;
+      return `<span class="state live">Live</span>`;
+    }
+
+    function compatCell(p, compat) {
+      if (!compat.participants) return `<span class="compat">${compat.error ? "Error" : "No list"}</span>`;
+      const c = compat.participants.find((x) => x.callSid === p.callId);
+      if (!c) return `<span class="compat">Not listed</span>`;
+      const bits = [c.muted ? "muted" : "unmuted", c.hold ? "hold" : "no hold"];
+      if (c.coaching) bits.push("coaching");
+      return `<span class="compat">Listed: ${bits.join(", ")}</span>`;
+    }
+
+    function isMismatch(p, compat) {
+      if (!compat.participants) return false;
+      const c = compat.participants.find((x) => x.callSid === p.callId);
+      return !c || Boolean(c.muted) !== Boolean(p.muted) || Boolean(c.hold) !== Boolean(p.hold);
+    }
+
+    function renderRoom(room) {
+      const others = (id) => room.participants.filter((p) => p.callId !== id);
+      const compatOnly = (room.compat.participants ?? []).filter((c) => !room.participants.some((p) => p.callId === c.callSid));
+      const nameNote = room.compat.foundByName
+        ? room.compat.foundByName === room.id ? "Compat finds it by name, same ID" : `Compat finds a different ID by name: ${esc(room.compat.foundByName)}`
+        : "Compat doesn't find it by name";
+
+      const rows = room.participants.map((p) => `
+        <tr class="${isMismatch(p, room.compat) ? "mismatch" : ""}">
+          <td>${esc(label(p))}</td>
+          <td>${esc(p.type || "?")}${p.origin ? `<br><span class="compat">${esc(p.origin)}</span>` : ""}</td>
+          <td>${stateCell(p)}</td>
+          <td>${compatCell(p, room.compat)}</td>
+          <td>
+            <div class="group"><span class="via">Compat</span>
+              <button data-a="mute" data-id="${esc(p.callId)}" data-v="${!p.muted}">${p.muted ? "Unmute" : "Mute"}</button>
+              <button data-a="hold" data-id="${esc(p.callId)}" data-v="${!p.hold}">${p.hold ? "Resume" : "Hold"}</button>
+              ${p.coaching
+                ? `<button data-a="coach" data-id="${esc(p.callId)}" data-v="">Stop coaching</button>`
+                : `<button data-a="coach" data-id="${esc(p.callId)}" ${others(p.callId).length ? "" : "disabled"}>Coach</button>`}
+              <button class="danger" data-a="remove" data-id="${esc(p.callId)}">Remove</button>
+            </div>
+            <div class="group"><span class="via">Calling API</span>
+              <button data-a="reseat" data-mode="${p.muted ? "unmute" : "mute"}" data-id="${esc(p.callId)}">${p.muted ? "Rejoin unmuted" : "Rejoin muted"}</button>
+              <button data-a="reseat" data-mode="coach" data-id="${esc(p.callId)}" ${others(p.callId).length ? "" : "disabled"}>Rejoin as coach</button>
+              <button data-a="park" data-id="${esc(p.callId)}">Park</button>
+              <button data-a="transfer" data-id="${esc(p.callId)}">Transfer</button>
+              <button class="danger" data-a="end" data-id="${esc(p.callId)}">Hang up</button>
+            </div>
+            ${others(p.callId).length
+              ? `<label class="target">Coach target <select data-coach-for="${esc(p.callId)}">${others(p.callId).map((o) => `<option value="${esc(o.callId)}">${esc(label(o))} (${esc(short(o.callId))})</option>`).join("")}</select></label>`
+              : ""}
+          </td>
+          <td class="sid">${esc(p.callId)}</td>
+        </tr>`).join("");
+
+      const compatRows = compatOnly.map((c) => `
+        <tr class="mismatch">
+          <td colspan="3">Listed by Compat only (no join callback received)</td>
+          <td class="compat">${c.muted ? "muted" : "unmuted"}, ${c.hold ? "hold" : "no hold"}</td>
+          <td></td>
+          <td class="sid">${esc(c.callSid)}</td>
+        </tr>`).join("");
+
+      return `
+        <h2>${esc(room.name)}</h2>
+        <p class="note">${room.id ? `Conference ID ${esc(room.id)}. ${nameNote}.` : `Not started. ${nameNote}.`}
+          ${room.compat.error ? `<br>Compat lookup error: ${esc(room.compat.error)}` : ""}</p>
+        <div class="wrap">
+          <table>
+            <thead><tr><th>Caller</th><th>Type</th><th>State (callbacks)</th><th>Compat list</th><th>Actions</th><th>Call ID</th></tr></thead>
+            <tbody>${rows || compatRows ? rows + compatRows : `<tr><td class="empty" colspan="6">Nobody is in this room.</td></tr>`}</tbody>
+          </table>
+        </div>`;
+    }
+
+    function renderParked(parked) {
+      $("parked").innerHTML = parked.map((p) => `
+        <tr>
+          <td>${esc(label(p))}</td>
+          <td>${esc(p.type || "?")}</td>
+          <td>${esc(new Date(p.parkedAt).toLocaleTimeString())}</td>
+          <td>
+            <button data-a="return" data-id="${esc(p.callId)}">Return</button>
+            <button class="danger" data-a="end" data-id="${esc(p.callId)}">Hang up</button>
+          </td>
+          <td class="sid">${esc(p.callId)}</td>
+        </tr>`).join("") || `<tr><td class="empty" colspan="5">Nobody is parked.</td></tr>`;
+    }
+
+    function renderLog(events) {
+      $("log").innerHTML = events.map((e) => {
+        const { at, format, event, callId, ...rest } = e;
+        return `
+          <tr>
+            <td>${esc(new Date(at).toLocaleTimeString())}</td>
+            <td>${esc(format)}</td>
+            <td><details><summary>${esc(event ?? "unknown")}${rest.stale ? " (stale, ignored)" : ""}</summary><pre>${esc(JSON.stringify(rest, null, 2))}</pre></details></td>
+            <td class="sid">${esc(callId)}</td>
+          </tr>`;
+      }).join("") || `<tr><td class="empty" colspan="4">No events yet. Join a leg to the room to start.</td></tr>`;
+    }
+
+    function renderDialTargets() {
+      const room = state.rooms.find((r) => r.name === $("dial-room").value) ?? state.rooms[0];
+      const prev = $("dial-coach").value;
+      $("dial-coach").innerHTML = (room?.participants ?? []).map((p) => `<option value="${esc(p.callId)}">${esc(label(p))} (${esc(short(p.callId))})</option>`).join("");
+      if (prev) $("dial-coach").value = prev;
+      $("dial-coach").disabled = $("dial-role").value !== "coach";
+    }
+
+    function render(s) {
+      state = s;
+      $("summary").textContent = `Callbacks: ${s.statusEventType}. ${s.rooms.map((r) => `${r.name}: ${r.participants.length}`).join(", ")}. Highlighted rows disagree with the Compat participant list.`;
+      const picked = Object.fromEntries([...document.querySelectorAll("select[data-coach-for]")].map((el) => [el.dataset.coachFor, el.value]));
+      $("rooms").innerHTML = s.rooms.map(renderRoom).join("");
+      for (const [id, value] of Object.entries(picked)) {
+        const el = document.querySelector(`select[data-coach-for="${CSS.escape(id)}"]`);
+        if (el && [...el.options].some((o) => o.value === value)) el.value = value;
+      }
+      renderParked(s.parked);
+      renderLog(s.events);
+      if (!$("dial-room").options.length) {
+        $("dial-room").innerHTML = s.rooms.map((r) => `<option>${esc(r.name)}</option>`).join("");
+      }
+      renderDialTargets();
+    }
+
+    async function call(url, init = {}) {
+      const res = await fetch(url, { headers: { "Content-Type": "application/json" }, ...init });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+      return res.status === 204 ? null : res.json();
+    }
+
+    const confirms = {
+      remove: "Remove this leg from the conference? It hears a goodbye message, then hangs up.",
+      end: "Hang up this leg?",
+      transfer: "Move this leg to the other room?",
+      reseat: "Re-seat this leg? It briefly leaves the room and rejoins with the new setting.",
+    };
+
+    async function onAction(e) {
+      const btn = e.target.closest("button[data-a]");
+      if (!btn) return;
+      const { a, id, v } = btn.dataset;
+      if (confirms[a] && !confirm(confirms[a])) return;
+
+      const p = `/api/participants/${encodeURIComponent(id)}`;
+      btn.disabled = true;
+      $("error").textContent = "";
+      try {
+        if (a === "mute" || a === "hold") await call(p, { method: "POST", body: JSON.stringify({ [a === "mute" ? "muted" : "hold"]: v === "true" }) });
+        else if (a === "coach") {
+          const target = v === "" ? null : document.querySelector(`select[data-coach-for="${CSS.escape(id)}"]`)?.value;
+          await call(`${p}/coach`, { method: "POST", body: JSON.stringify({ target }) });
+        }
+        else if (a === "reseat") {
+          const target = btn.dataset.mode === "coach" ? document.querySelector(`select[data-coach-for="${CSS.escape(id)}"]`)?.value : undefined;
+          await call(`${p}/reseat`, { method: "POST", body: JSON.stringify({ mode: btn.dataset.mode, target }) });
+        }
+        else if (a === "remove") await call(p, { method: "DELETE" });
+        else if (a === "park" || a === "transfer") await call(`${p}/${a}`, { method: "POST" });
+        else if (a === "return") await call(`/api/parked/${encodeURIComponent(id)}/return`, { method: "POST" });
+        else if (a === "end") await call(`/api/calls/${encodeURIComponent(id)}/end`, { method: "POST" });
+      } catch (err) {
+        $("error").textContent = `Couldn't ${a} ${short(id)}: ${err.message}`;
+        btn.disabled = false;
+      }
+    }
+    $("rooms").addEventListener("click", onAction);
+    $("parked").addEventListener("click", onAction);
+
+    $("dial-role").onchange = renderDialTargets;
+    $("dial-room").onchange = renderDialTargets;
+    $("dial-go").onclick = async () => {
+      $("error").textContent = "";
+      $("dial-go").disabled = true;
+      try {
+        const role = $("dial-role").value;
+        await call("/api/dial", {
+          method: "POST",
+          body: JSON.stringify({
+            to: $("dial-to").value.trim(),
+            room: $("dial-room").value,
+            role,
+            coachTarget: role === "coach" ? $("dial-coach").value : undefined,
+          }),
+        });
+      } catch (err) {
+        $("error").textContent = `Couldn't dial: ${err.message}`;
+      } finally {
+        $("dial-go").disabled = false;
+      }
+    };
+
+    const events = new EventSource("/api/events");
+    events.onmessage = (e) => render(JSON.parse(e.data));
+    events.onerror = () => { $("summary").textContent = "Lost connection to the server. Retrying…"; };
+  </script>
+</body>
+</html>
